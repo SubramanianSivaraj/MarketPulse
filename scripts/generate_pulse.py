@@ -40,7 +40,9 @@ COHORT_PATH = DATA_DIR / "cohort.json"
 DAILY_OUT = ROOT / "index.html"
 TRACKER_OUT = ROOT / "tracker" / "index.html"
 
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-flash-latest"  # Google-managed alias that always points at the
+# current GA Flash model, so this doesn't break every time a dated version
+# (like gemini-2.5-flash) gets retired for new API users.
 
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
