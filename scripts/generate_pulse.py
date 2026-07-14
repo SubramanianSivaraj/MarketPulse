@@ -7,28 +7,38 @@ Generates both Market Pulse pages:
 Run by GitHub Actions on a cron schedule (see .github/workflows/daily-pulse.yml),
 but you can also run it locally:
 
+    export TAVILY_API_KEY=tvly-...
     export GEMINI_API_KEY=AIza...
     pip install -r requirements.txt
     python scripts/generate_pulse.py
 
-NOTE ON THE GEMINI API CALL: this script uses Gemini's built-in Google Search
-grounding tool (executed on Google's side, results folded into the same
-response) so a single generate_content() call can research and answer in one
-round trip. Get a free API key (no credit card required) at
-https://aistudio.google.com/apikey -- the free tier comfortably covers this
-script's ~2 calls/day. This is the part most likely to need a small
-adjustment if the SDK response shape has changed since this was written --
+ARCHITECTURE NOTE: search and writing are two separate steps, on purpose.
+Gemini's own built-in Google Search grounding tool turned out to have a very
+tight, separately-metered free-tier quota (it 429'd almost immediately even
+though the underlying text-generation quota had plenty of headroom). So
+instead: Tavily's search API (free, no credit card, 1,000 credits/month) does
+the actual web research, and Gemini only ever sees plain text -- it just
+reads the search results handed to it and writes the JSON. This uses
+Gemini's much more generous plain-generation quota and avoids the grounding
+tool entirely.
+
+Get free keys at:
+  - https://app.tavily.com          (Tavily -- no card required)
+  - https://aistudio.google.com/apikey (Gemini -- no card required)
+
 Claude (in the Cowork chat that produced this repo) could not test this
-end-to-end against a live API key, so verify the first few runs by hand.
+end-to-end against live API keys, so verify the first few runs by hand.
 """
 
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import requests
 from google import genai
 from google.genai import types
 from jinja2 import Environment, FileSystemLoader
@@ -44,7 +54,10 @@ MODEL = "gemini-flash-latest"  # Google-managed alias that always points at the
 # current GA Flash model, so this doesn't break every time a dated version
 # (like gemini-2.5-flash) gets retired for new API users.
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+TAVILY_URL = "https://api.tavily.com/search"
+
+gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
 
 def now_ist_string():
@@ -61,7 +74,7 @@ def now_ist_string():
 
 def extract_json(text: str) -> dict:
     """Pull the first {...} JSON object out of a text blob and parse it.
-    Claude is instructed to return ONLY JSON, but this is a defensive
+    The model is instructed to return ONLY JSON, but this is a defensive
     fallback in case any stray prose sneaks in around it."""
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
@@ -69,14 +82,38 @@ def extract_json(text: str) -> dict:
     return json.loads(match.group(0))
 
 
-def call_gemini_with_search(prompt: str, max_tokens: int = 8000) -> dict:
-    response = client.models.generate_content(
+def tavily_search(query: str, max_results: int = 5) -> str:
+    """Query Tavily's search API and return a plain-text block (title + url +
+    snippet per result) suitable for pasting into an LLM prompt as research
+    context. Raises on HTTP error so a bad/missing key fails loudly rather
+    than silently producing an empty briefing."""
+    resp = requests.post(
+        TAVILY_URL,
+        json={
+            "api_key": TAVILY_API_KEY,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": max_results,
+            "include_answer": False,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        return "(no results found for this query)"
+    lines = [f"- {r.get('title', '')} ({r.get('url', '')}): {r.get('content', '')}" for r in results]
+    return "\n".join(lines)
+
+
+def call_gemini(prompt: str, max_tokens: int = 8000) -> dict:
+    """Plain (non-grounded) Gemini call -- the model only sees whatever
+    search context we've already pasted into the prompt, no tools."""
+    response = gemini_client.models.generate_content(
         model=MODEL,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            tools=[types.Tool(google_search=types.GoogleSearch())],
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(max_output_tokens=max_tokens),
     )
     full_text = response.text or ""
     return extract_json(full_text)
@@ -86,42 +123,59 @@ def call_gemini_with_search(prompt: str, max_tokens: int = 8000) -> dict:
 # STEP 1: Daily Market Pulse (fresh picks every run)
 # ---------------------------------------------------------------------------
 
-DAILY_PROMPT = """You are researching today's stock market news to build a "Daily Market Pulse" briefing, same format every day. Use web search to find CURRENT, same-day information -- do not use stale training data.
+DAILY_SEARCH_QUERIES = [
+    "India stock market news today Sensex Nifty top gainers losers",
+    "India stocks in the news today order win earnings dividend buyback large mid small cap",
+    "US stock market news today Dow S&P 500 Nasdaq top movers",
+    "US stocks in the news today catalyst earnings contract large mid small cap",
+]
 
-Research and return ONLY a JSON object (no prose before or after) with this exact shape:
+DAILY_PROMPT_TEMPLATE = """You are building a "Daily Market Pulse" briefing, same format every day. Base your answer ONLY on the search context provided below -- it was fetched live moments ago, so treat it as current and do not fall back on older training-data knowledge about these companies.
 
-{
-  "india": {
+SEARCH CONTEXT (from live web search just now):
+{search_context}
+
+Using only the information above (plus reasonable synthesis of it), return ONLY a JSON object (no prose before or after) with this exact shape:
+
+{{
+  "india": {{
     "index_cards": [
-      {"name": "Sensex", "val": "77,022.83", "chg": "+544.16 (+0.71%)", "cls": "up", "border_color": "#059669"},
-      {"name": "Nifty 50", "val": "24,002.65", "chg": "+136.90 (+0.57%)", "cls": "up", "border_color": "#059669"},
-      {"name": "Drivers", "val": "", "chg": "one or two sentence summary of what's driving the market today", "cls": "", "border_color": "#e8a317"}
+      {{"name": "Sensex", "val": "77,022.83", "chg": "+544.16 (+0.71%)", "cls": "up", "border_color": "#059669"}},
+      {{"name": "Nifty 50", "val": "24,002.65", "chg": "+136.90 (+0.57%)", "cls": "up", "border_color": "#059669"}},
+      {{"name": "Drivers", "val": "", "chg": "one or two sentence summary of what's driving the market today", "cls": "", "border_color": "#e8a317"}}
     ],
     "stocks": [
-      {"name": "Company Name", "ticker": "NSECODE", "cap": "Large", "price": "₹1,234.50", "price_note": "", "move": "+2.5%", "move_cls": "up", "why": "one or two sentences on the specific catalyst", "flag": ""}
+      {{"name": "Company Name", "ticker": "NSECODE", "cap": "Large", "price": "₹1,234.50", "price_note": "", "move": "+2.5%", "move_cls": "up", "why": "one or two sentences on the specific catalyst", "flag": ""}}
     ]
-  },
-  "usa": {
+  }},
+  "usa": {{
     "index_cards": [ ... same shape, for Dow/S&P/Nasdaq and a Drivers card ... ],
     "stocks": [ ... same shape as india.stocks ... ]
-  },
+  }},
   "sources": ["domain1.com", "domain2.com", "..."],
   "footer_note": "one sentence noting this is a same-day news scan, not investment advice, built from web search"
-}
+}}
 
 Rules:
-- Exactly 10 stocks in india.stocks and 10 in usa.stocks, cap field one of "Large"/"Mid"/"Small", spread across all three as evenly as the actual news supports (do not force false balance).
-- USA section: if US markets are closed (weekend/holiday), use the most recently completed session and say so in usa.index_cards drivers text.
+- Exactly 10 stocks in india.stocks and 10 in usa.stocks, cap field one of "Large"/"Mid"/"Small", spread across all three as evenly as the actual search context supports (do not force false balance).
+- USA section: if the context suggests US markets are closed (weekend/holiday), use the most recently completed session and say so in usa.index_cards drivers text.
 - move_cls must be "up", "down", or "" (empty for non-directional items like "order win" or "buyback").
-- "why" must cite a specific, concrete catalyst (earnings, order win, dividend, brokerage note, M&A, etc.) -- never vague filler like "sector is up".
+- "why" must cite a specific, concrete catalyst (earnings, order win, dividend, brokerage note, M&A, etc.) from the search context -- never vague filler like "sector is up".
 - If a stock's price is stretched on valuation (very high P/E, huge run already priced in), set "flag" to a short risk note; otherwise leave flag as "".
-- If a price is uncertain or conflicting across sources, put the caveat in "price_note" (e.g. "quotes varied $145-$163") rather than presenting false precision.
-- Never fabricate a stock, price, or catalyst not actually returned by search.
+- If a price is uncertain, missing, or conflicting in the search context, put the caveat in "price_note" (e.g. "quotes varied $145-$163") rather than presenting false precision.
+- Never fabricate a stock, price, or catalyst that isn't actually supported by the search context above. If the context is too thin to fill all 10 slots for a market, use fewer stocks rather than inventing ones.
 """
 
 
 def build_daily_pulse(env: Environment, date_line: str, compact_ts: str):
-    data = call_gemini_with_search(DAILY_PROMPT)
+    context_blocks = []
+    for q in DAILY_SEARCH_QUERIES:
+        context_blocks.append(f"### Search: {q}\n{tavily_search(q)}")
+    search_context = "\n\n".join(context_blocks)
+
+    prompt = DAILY_PROMPT_TEMPLATE.format(search_context=search_context)
+    data = call_gemini(prompt)
+
     template = env.get_template("daily_pulse.html.j2")
     html = template.render(
         date_line=date_line,
@@ -142,7 +196,7 @@ def build_daily_pulse(env: Environment, date_line: str, compact_ts: str):
 # STEP 2: Forward tracker (fixed cohort, re-priced each run)
 # ---------------------------------------------------------------------------
 
-REPRICE_PROMPT_TEMPLATE = """Use web search to find the CURRENT share price for each of these {n} stocks. Return ONLY a JSON object (no prose) mapping each ticker to its current price as a plain number (no currency symbols, no commas) plus an optional one-line note if the quote is stale/uncertain/conflicting across sources:
+REPRICE_PROMPT_TEMPLATE = """Based ONLY on the search context below (fetched live moments ago), determine the CURRENT share price for each of these {n} stocks. Return ONLY a JSON object (no prose) mapping each ticker to its current price as a plain number (no currency symbols, no commas) plus an optional one-line note if the quote is stale/uncertain/conflicting in the context:
 
 {{
   "TICKER1": {{"price": 1234.5, "note": ""}},
@@ -152,7 +206,10 @@ REPRICE_PROMPT_TEMPLATE = """Use web search to find the CURRENT share price for 
 Stocks to look up (name / ticker / market):
 {stock_list}
 
-Do not fabricate a price -- if you truly cannot find one, omit that ticker from the JSON entirely rather than guessing.
+SEARCH CONTEXT (from live web search just now, one block per ticker):
+{search_context}
+
+Do not fabricate a price -- if the context truly doesn't contain a usable price for a ticker, omit that ticker from the JSON entirely rather than guessing.
 """
 
 
@@ -169,13 +226,19 @@ def build_tracker(env: Environment, date_line: str, compact_ts: str, ist_now: da
     complete = day_number >= window_days
     day_label = f"Day {min(day_number, window_days)} of {window_days}"
 
-    stock_list_lines = [
-        f"- {s['name']} / {s['ticker']} / {s['market']}" for s in cohort_data["cohort"]
-    ]
+    stock_list_lines = []
+    price_context_blocks = []
+    for s in cohort_data["cohort"]:
+        stock_list_lines.append(f"- {s['name']} / {s['ticker']} / {s['market']}")
+        query = f"{s['name']} {s['ticker']} share price today"
+        price_context_blocks.append(f"### {s['ticker']}\n{tavily_search(query, max_results=3)}")
+
     prompt = REPRICE_PROMPT_TEMPLATE.format(
-        n=len(cohort_data["cohort"]), stock_list="\n".join(stock_list_lines)
+        n=len(cohort_data["cohort"]),
+        stock_list="\n".join(stock_list_lines),
+        search_context="\n\n".join(price_context_blocks),
     )
-    prices = call_gemini_with_search(prompt, max_tokens=4000)
+    prices = call_gemini(prompt, max_tokens=4000)
 
     india_rows, usa_rows = [], []
     changes = []
