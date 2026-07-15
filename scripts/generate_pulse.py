@@ -39,6 +39,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+import yfinance as yf
 from google import genai
 from google.genai import types
 from jinja2 import Environment, FileSystemLoader
@@ -197,6 +198,42 @@ Rules:
 """
 
 
+def enrich_with_fundamentals(stock: dict, market: str) -> None:
+    """Best-effort balance-sheet risk overlay using yfinance (free, no API
+    key, but an UNOFFICIAL Yahoo Finance client -- it can silently return
+    incomplete data or fail outright if Yahoo changes something). Mutates
+    stock in place, appending a short risk note to stock['flag'] if the
+    company looks over-leveraged or cash-flow negative. This is deliberately
+    a lightweight overlay, not a fundamentals table -- the page's job is
+    still same-day news reactivity, this just adds a guardrail so a stock
+    spiking on hype with a rotten balance sheet gets flagged.
+    Any failure here (bad ticker mapping, Yahoo rate limit, etc.) is
+    swallowed silently so it never breaks the whole run."""
+    ticker = stock.get("ticker", "")
+    if not ticker:
+        return
+    yf_ticker = f"{ticker}.NS" if market == "india" else ticker
+    try:
+        info = yf.Ticker(yf_ticker).info
+    except Exception:
+        return
+    if not info:
+        return
+
+    notes = []
+    de = info.get("debtToEquity")
+    if isinstance(de, (int, float)) and de > 150:
+        notes.append(f"D/E {de:.0f}% -- high leverage")
+    fcf = info.get("freeCashflow")
+    if isinstance(fcf, (int, float)) and fcf < 0:
+        notes.append("negative free cash flow")
+
+    if notes:
+        combined = "; ".join(notes)
+        existing = stock.get("flag", "")
+        stock["flag"] = f"{existing}; {combined}".strip("; ") if existing else combined
+
+
 def build_daily_pulse(env: Environment, date_line: str, compact_ts: str):
     context_blocks = []
     for q, kwargs in DAILY_SEARCH_QUERIES:
@@ -217,6 +254,11 @@ def build_daily_pulse(env: Environment, date_line: str, compact_ts: str):
             f"before finishing (increase max_tokens further if this recurs). "
             f"Keys present: {list(data.keys())}"
         )
+
+    for stock in data["india"].get("stocks", []):
+        enrich_with_fundamentals(stock, "india")
+    for stock in data["usa"].get("stocks", []):
+        enrich_with_fundamentals(stock, "usa")
 
     template = env.get_template("daily_pulse.html.j2")
     html = template.render(
