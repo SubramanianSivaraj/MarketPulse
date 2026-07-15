@@ -198,7 +198,19 @@ def build_daily_pulse(env: Environment, date_line: str, compact_ts: str):
     search_context = "\n\n".join(context_blocks)
 
     prompt = DAILY_PROMPT_TEMPLATE.format(search_context=search_context)
-    data = call_gemini(prompt)
+    # Larger context (5 search blocks now) needs more output headroom too --
+    # the previous 8000-token cap let the model get cut off mid-response
+    # (finished "india" but never reached "usa"), producing valid-but-
+    # incomplete JSON. 16000 gives real margin for two 10-stock sections.
+    data = call_gemini(prompt, max_tokens=16000)
+
+    missing = [k for k in ("india", "usa") if k not in data]
+    if missing:
+        raise ValueError(
+            f"Gemini response is missing top-level key(s) {missing} -- likely truncated "
+            f"before finishing (increase max_tokens further if this recurs). "
+            f"Keys present: {list(data.keys())}"
+        )
 
     template = env.get_template("daily_pulse.html.j2")
     html = template.render(
