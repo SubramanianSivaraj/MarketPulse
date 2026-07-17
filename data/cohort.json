@@ -1,7 +1,7 @@
 {
   "entryDate": "2026-07-01",
   "windowDays": 14,
-  "lastChecked": "2026-07-15",
+  "lastChecked": "2026-07-17",
   "cohort": [
     {
       "market": "India",
@@ -10,7 +10,7 @@
       "cap": "Large",
       "entryPrice": 264.6,
       "currency": "INR",
-      "lastPrice": 286.15,
+      "lastPrice": 294.9,
       "why": "Top Nifty gainer on sectoral tailwinds and positive earnings expectations."
     },
     {
