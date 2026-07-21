@@ -1,7 +1,7 @@
 {
   "entryDate": "2026-07-01",
   "windowDays": 14,
-  "lastChecked": "2026-07-20",
+  "lastChecked": "2026-07-21",
   "cohort": [
     {
       "market": "India",
@@ -10,7 +10,7 @@
       "cap": "Large",
       "entryPrice": 264.6,
       "currency": "INR",
-      "lastPrice": 286.6,
+      "lastPrice": 285.1,
       "why": "Top Nifty gainer on sectoral tailwinds and positive earnings expectations."
     },
     {
@@ -40,7 +40,7 @@
       "cap": "Large",
       "entryPrice": 3068.8,
       "currency": "INR",
-      "lastPrice": 3160.4,
+      "lastPrice": 3179.2,
       "why": "Auto pack extending gains for a second straight session."
     },
     {
@@ -70,7 +70,7 @@
       "cap": "Mid",
       "entryPrice": 541.0,
       "currency": "INR",
-      "lastPrice": 489.9,
+      "lastPrice": 487.75,
       "why": "Won \u20b91,754 crore of new orders across T&D, towers, cables.",
       "note": "Entry price was itself a stale pre-1-Jul quote \u2014 treat the day-over-day change as unreliable."
     },
@@ -81,7 +81,7 @@
       "cap": "Mid",
       "entryPrice": 213.69,
       "currency": "INR",
-      "lastPrice": 214.0,
+      "lastPrice": 208.5,
       "why": "\u20b921,206cr order book but ~103\u2013127x P/E \u2014 testing whether valuation catches up with it."
     },
     {
@@ -91,7 +91,7 @@
       "cap": "Small",
       "entryPrice": 2110.8,
       "currency": "INR",
-      "lastPrice": 2120.0,
+      "lastPrice": 2103.45,
       "why": "Opened higher after securing a new international order.",
       "note": "Entry price was itself a stale pre-1-Jul quote \u2014 treat the day-over-day change as unreliable."
     },
